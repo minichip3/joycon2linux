@@ -1,4 +1,4 @@
-"""Joy-Con binary → evdev event mapping."""
+"""Joy-Con 2 binary → evdev event mapping."""
 
 from __future__ import annotations
 
@@ -26,7 +26,8 @@ BUTTON_TO_EVDEV: dict[int, int] = {
     Buttons.SL: ecodes.BTN_TL2,
     Buttons.SR: ecodes.BTN_TR2,
     Buttons.CAPTURE: ecodes.BTN_TRIGGER,
-    # ZR is the right trigger axis, mapped via ABS_RZ — handled separately
+    Buttons.ZR: ecodes.BTN_TRIGGER_HAPPY,
+    # Buttons.ZL → handled via ABS_Z trigger axis
 }
 
 # D-pad buttons are NOT mapped to BTN_ keys; they drive ABS_HAT0X/HAT0Y.
@@ -37,8 +38,8 @@ DPAD_BUTTONS: set[int] = {
     Buttons.DRIGHT,
 }
 
-# Stick deadzone — raw values within ±15 of center (128) are zeroed out.
-STICK_DEADZONE: int = 15
+# Stick deadzone — raw 12-bit values within ±DEADZONE of center (2048) are zeroed.
+STICK_DEADZONE: int = 128
 
 
 # ---------------------------------------------------------------------------
@@ -47,16 +48,14 @@ STICK_DEADZONE: int = 15
 
 
 def _map_stick(raw: int) -> int:
-    """Map a 0-255 stick value (128=center) to -32767..32767 with deadzone.
+    """Map a 12-bit stick value (0-4095, 2048=center) to -32767..32767.
 
-    The raw value 0 maps to -32767, 128 to 0, and 255 to 32767.
     Values within ±*STICK_DEADZONE* of center are clamped to 0.
     """
-    offset = raw - 128  # -128..127
+    offset = raw - 2048  # -2048..2047
     if abs(offset) <= STICK_DEADZONE:
         return 0
-    # Scale: offset ∈ [-128, 127] → [-32767, 32767]
-    return int(offset * 32767 / 128)
+    return int(offset * 32767 / 2048)
 
 
 def _map_trigger(raw: int) -> int:
@@ -65,11 +64,7 @@ def _map_trigger(raw: int) -> int:
 
 
 def _dpad_to_hat(buttons: int) -> tuple[int, int]:
-    """Convert D-pad button bits to (HAT_X, HAT_Y) values.
-
-    Supports all 8 directions plus center (no buttons pressed).
-    Conflicting bits (e.g. UP + DOWN) resolve to neutral on that axis.
-    """
+    """Convert D-pad button bits to (HAT_X, HAT_Y) values."""
     h_x = 0
     h_y = 0
 
@@ -92,18 +87,7 @@ def _dpad_to_hat(buttons: int) -> tuple[int, int]:
 
 
 def joycon_to_evdev(report: InputReport, prev_buttons: int = 0) -> list[InputEvent]:
-    """Convert a Joy-Con :class:`InputReport` into a list of evdev events.
-
-    Args:
-        report: Decoded input report from the controller.
-        prev_buttons: Button bitmask from the previous frame. Used to detect
-            press/release edges for button events.
-
-    Returns:
-        List of :class:`evdev.InputEvent` objects ready for injection into
-        a :class:`UinputGamepad`. Callers should pass ``prev_buttons`` on
-        subsequent calls to avoid stale button events.
-    """
+    """Convert a Joy-Con 2 input report into a list of evdev events."""
     events: list[InputEvent] = []
 
     # ---- Stick axes -------------------------------------------------------
@@ -120,10 +104,6 @@ def joycon_to_evdev(report: InputReport, prev_buttons: int = 0) -> list[InputEve
     events.append(InputEvent(ecodes.EV_ABS, ecodes.ABS_Z, _map_trigger(report.trigger_l)))
     events.append(InputEvent(ecodes.EV_ABS, ecodes.ABS_RZ, _map_trigger(report.trigger_r)))
 
-    # ZR button → right trigger axis (ABS_RZ) — redundant with trigger_r above,
-    # but included here for completeness if firmware reports it separately.
-    # In practice trigger_r already covers ZR.
-
     # ---- D-pad → HAT ------------------------------------------------------
     h_x, h_y = _dpad_to_hat(report.buttons)
     events.append(InputEvent(ecodes.EV_ABS, ecodes.ABS_HAT0X, h_x))
@@ -132,7 +112,6 @@ def joycon_to_evdev(report: InputReport, prev_buttons: int = 0) -> list[InputEve
     # ---- Button edges -----------------------------------------------------
     for name, mask in Buttons._ALL.items():
         if name in ("UP", "DOWN", "DLEFT", "DRIGHT"):
-            # D-pad handled above via HAT
             continue
         btn_pressed = bool(report.buttons & mask)
         prev_pressed = bool(prev_buttons & mask)
