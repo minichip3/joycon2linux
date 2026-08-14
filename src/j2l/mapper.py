@@ -21,7 +21,7 @@ BUTTON_TO_EVDEV: dict[int, int] = {
     Buttons.MINUS: ecodes.BTN_SELECT,
     Buttons.PLUS: ecodes.BTN_START,
     Buttons.LS: ecodes.BTN_THUMB,
-    Buttons.XR: ecodes.BTN_THUMB_R,
+    Buttons.XR: ecodes.BTN_BASE2,
     Buttons.HOME: ecodes.BTN_MODE,
     Buttons.SL: ecodes.BTN_TL2,
     Buttons.SR: ecodes.BTN_TR2,
