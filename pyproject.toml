@@ -16,9 +16,8 @@ j2l = "j2l.cli:cli"
 [tool.setuptools]
 packages = ["j2l"]
 
-[tool.setuptools.ext-modules]
-_ble = {
-    sources = ["src/j2l/_ble.c"],
-    include-dirs = ["src/j2l/cinclude"],
-    libraries = ["bluetooth"],
-}
+[[tool.setuptools.ext-modules]]
+name = "j2l._ble"
+sources = ["src/j2l/_ble.c"]
+include-dirs = ["src/j2l/cinclude"]
+libraries = ["bluetooth"]
