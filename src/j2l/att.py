@@ -140,17 +140,19 @@ class ATTClient:
     # Connection
     # ------------------------------------------------------------------ #
 
-    def connect(self, timeout: float = 10.0) -> tuple[bool, str]:
-        """Try LE public and random target address types."""
+    def connect(self, timeout: float = 10.0, retries: int = 3) -> tuple[bool, str]:
+        """Try LE random first (Switch 2 controllers use random address),
+        falling back to public.  Retries up to *retries* times."""
         per = max(0.1, timeout / 2)
         errors: list[str] = []
-        for dst_type in (LE_PUBLIC, LE_RANDOM):
-            ok, detail = self._connect_once(dst_type, per)
-            if ok:
-                self.dst_type = dst_type
-                return True, "ok"
-            label = "public" if dst_type == LE_PUBLIC else "random"
-            errors.append(f"{label}: {detail}")
+        for attempt in range(1, retries + 1):
+            for dst_type in (LE_RANDOM, LE_PUBLIC):
+                ok, detail = self._connect_once(dst_type, per)
+                if ok:
+                    self.dst_type = dst_type
+                    return True, "ok"
+                label = "public" if dst_type == LE_PUBLIC else "random"
+                errors.append(f"attempt {attempt} {label}: {detail}")
         return False, "; ".join(errors)
 
     def _connect_once(self, dst_type: int, timeout: float) -> tuple[bool, str]:

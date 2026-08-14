@@ -109,7 +109,7 @@ class BleConnection:
         self._att.notification_cb = self._on_att_notification
         self._att.disconnect_cb = self._on_att_disconnect
 
-        ok, detail = await asyncio.to_thread(self._att.connect, timeout=10.0)
+        ok, detail = await asyncio.to_thread(self._att.connect, timeout=10.0, retries=3)
         if not ok:
             self._att.close()
             self._att = None
