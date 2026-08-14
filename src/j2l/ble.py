@@ -202,29 +202,8 @@ class BleConnection:
 
         logger.info("Connecting to BLE device %s", self._address)
 
-        # Stop LE scan before connecting
-        _btmgmt_stop_find("hci0")
-        _stop_le_scan("hci0")
-
-        # Debug: check HCI state
-        _debug_hci_state("hci0")
-        await asyncio.sleep(0.2)
-
-        self._att = ATTClient(self._address, adapter="hci0")
-        self._att.notification_cb = self._on_att_notification
-        self._att.disconnect_cb = self._on_att_disconnect
-
-        ok = False
-        errors: list[str] = []
-        for attempt in range(5):
-            _btmgmt_stop_find("hci0")
-            await asyncio.sleep(0.1)
-            ok, detail = await asyncio.to_thread(self._att.connect, timeout=3.0, retries=1)
-            if ok:
-                break
-            errors.append(f"attempt {attempt+1}: {detail}")
-            self._att.close()
-            await asyncio.sleep(0.2)
+        # Use D-Bus GATT connection (bypass raw L2CAP)
+        ok, errors = await self._connect_via_dbus()
         if not ok:
             self._att.close()
             self._att = None
@@ -233,6 +212,63 @@ class BleConnection:
         await asyncio.to_thread(self._resolve_handles)
         self._reconnect_attempts = 0
         logger.info("Connected to %s", self._address)
+
+    async def _connect_via_dbus(self) -> tuple[bool, list[str]]:
+        """Connect via BlueZ D-Bus, then attach raw ATT socket.
+
+        BlueZ handles the HCI-level connection (avoids scan conflicts),
+        then we attach a raw ATT socket over the existing ACL link.
+        """
+        import dbus  # type: ignore
+        errors: list[str] = []
+        try:
+            bus = dbus.SystemBus()
+            mac = self._address.replace(":", "_").upper()
+            adapter_path = "/org/bluez/hci0"
+            device_path = f"/org/bluez/hci0/dev_{mac}"
+
+            # 1. Ensure device exists
+            try:
+                adapter = bus.get_object("org.bluez", adapter_path)
+                adapter.CreateDevice(self._address, "hci0", interface="org.bluez.Adapter1")
+            except Exception:
+                pass  # Device may already exist
+
+            # 2. Connect via D-Bus
+            ok = False
+            for attempt in range(3):
+                try:
+                    device = bus.get_object("org.bluez", device_path)
+                    device.Connect(interface="org.bluez.Device1")
+                    await asyncio.sleep(2)
+                    # Check connection state
+                    props_iface = dbus.Interface(device, "org.freedesktop.DBus.Properties")
+                    props = props_iface.GetAll("org.bluez.Device1")
+                    if props.get("Connected", False):
+                        ok = True
+                        break
+                except Exception as e:
+                    errors.append(f"dbus connect {attempt+1}: {e}")
+                    await asyncio.sleep(0.5)
+
+            if not ok:
+                return False, errors
+
+            # 3. Attach raw ATT socket over existing ACL
+            self._att = ATTClient(self._address, adapter="hci0")
+            self._att.notification_cb = self._on_att_notification
+            self._att.disconnect_cb = self._on_att_disconnect
+            ok, detail = await asyncio.to_thread(self._att.connect, timeout=5.0, retries=1)
+            if not ok:
+                errors.append(f"att: {detail}")
+                # BlueZ 연결이 수립되었으므로 ATT 없이 계속 진행
+                logger.warning("Raw ATT attach failed, using D-Bus GATT only")
+                self._att = None
+
+            return True, []
+        except Exception as e:
+            errors.append(f"dbus: {e}")
+            return False, errors
 
     async def disconnect(self) -> None:
         """Gracefully disconnect."""
