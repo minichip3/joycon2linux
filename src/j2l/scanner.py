@@ -10,15 +10,20 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict
 
-from bleak import BleakScanner
-from bleak.exc import BleakDBusError
-
 from j2l.protocol import (
     INPUT_REPORT_UUID,
     RUMBLE_JOYCON_L_UUID,
     RUMBLE_JOYCON_R_UUID,
     RUMBLE_PRO_UUID,
 )
+
+try:
+    from bleak import BleakScanner
+    from bleak.exc import BleakDBusError
+
+    BLEAK_AVAILABLE = True
+except ImportError:
+    BLEAK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +69,7 @@ async def scan(
     return await _scan_with_bluetoothctl(timeout=timeout)
 
 
-def _classify_device(dev) -> DeviceInfo | None:
+def _classify_device(dev) -> DeviceInfo | None:  # noqa: ARG001
     """Decide whether *dev* is a known Switch 2 controller and which type."""
     has_nintendo_mfr = False
     if dev.details and hasattr(dev.details, "manufacturer_data"):
