@@ -1,0 +1,12 @@
+[Unit]
+Description=Joy-Con 2 Linux Bridge
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=%p/j2l run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
