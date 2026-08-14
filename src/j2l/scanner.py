@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Dict
 
 from bleak import BleakScanner
+from bleak.exc import BleakDBusError
 
 from j2l.protocol import (
     INPUT_REPORT_UUID,
@@ -54,7 +55,19 @@ async def scan(
     results: Dict[str, DeviceInfo] = {}
 
     async with BleakScanner() as scanner:
-        devices = await scanner.discover(timeout=timeout, return_on_first_found=False)
+        try:
+            devices = await scanner.discover(timeout=timeout, return_on_first_found=False)
+        except BleakDBusError as e:
+            if "InProgress" in str(e):
+                logger.warning(
+                    "BlueZ scan already in progress. "
+                    "Run 'bluetoothctl scan off' and try again."
+                )
+                raise RuntimeError(
+                    "BLE scan failed: another scanner is already running. "
+                    "Try 'bluetoothctl scan off' first."
+                ) from e
+            raise
 
     for dev in devices:
         info = _classify_device(dev)
