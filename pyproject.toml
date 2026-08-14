@@ -13,8 +13,8 @@ dependencies = [
 [project.scripts]
 j2l = "j2l.cli:cli"
 
-[tool.setuptools]
-packages = ["j2l"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [[tool.setuptools.ext-modules]]
 name = "j2l._ble"
