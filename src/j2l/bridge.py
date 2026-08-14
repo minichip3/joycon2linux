@@ -11,8 +11,6 @@ import logging
 import signal
 from typing import TYPE_CHECKING
 
-from bleak import BleakClient
-
 from j2l.ble import BleConnection
 from j2l.gamepad import UinputGamepad
 from j2l.mapper import joycon_to_evdev
@@ -114,7 +112,7 @@ class ControllerBridge:
     # Notification handler
     # ------------------------------------------------------------------
 
-    def _on_notification(self, client: BleakClient, data: bytearray) -> None:
+    def _on_notification(self, data: bytes) -> None:
         """Decode an incoming BLE input report and inject evdev events.
 
         Called by :class:`BleConnection` on every notification.  Errors
