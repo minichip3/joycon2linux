@@ -64,6 +64,19 @@ def baddr(mac: str) -> bytes:
     return bytes(int(x, 16) for x in reversed(mac.split(":")))
 
 
+def detect_adapter_mac(adapter_name: str = "hci0") -> str:
+    """Read the adapter's actual MAC address from sysfs.
+    Falls back to ``00:00:00:00:00:00`` if unavailable."""
+    import pathlib
+    addr_path = pathlib.Path(f"/sys/class/bluetooth/{adapter_name}/address")
+    if addr_path.exists():
+        try:
+            return addr_path.read_text().strip().upper()
+        except OSError:
+            pass
+    return "00:00:00:00:00:00"
+
+
 def _sockaddr_l2(psm: int, bdaddr: bytes, cid: int, atype: int) -> bytes:
     return struct.pack("<HH6sHB", AF_BLUETOOTH, psm, bdaddr, cid, atype) + b"\x00"
 
@@ -122,7 +135,8 @@ class ATTClient:
 
     def __init__(self, dst: str, adapter: str = "hci0", dst_type: int = LE_PUBLIC):
         self.dst = dst
-        self.adapter = adapter
+        self.adapter = adapter  # adapter name (hci0)
+        self.adapter_mac = detect_adapter_mac(adapter)  # actual MAC for bind
         self.dst_type = dst_type
         self.sock: Optional[socket.socket] = None
         self.mtu = 23
@@ -162,8 +176,8 @@ class ATTClient:
         )
         fd = s.fileno()
 
-        # Bind to adapter — use all-zero BD_ADDR for LE (ignores specific adapter MAC)
-        bind_addr = _sockaddr_l2(0, b"\x00\x00\x00\x00\x00\x00", ATT_CID, LE_PUBLIC)
+        # Bind to adapter — use actual adapter MAC (switch2-controllers-linux style)
+        bind_addr = _sockaddr_l2(0, baddr(self.adapter_mac), ATT_CID, LE_PUBLIC)
         if _libc.bind(fd, bind_addr, len(bind_addr)) != 0:
             s.close()
             return False, f"L2CAP bind failed (errno {ctypes.get_errno()})"

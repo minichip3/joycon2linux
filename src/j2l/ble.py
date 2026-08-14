@@ -29,31 +29,57 @@ RECONNECT_DELAY_SECONDS = 2.0
 NotifyCallback = Callable[[bytes], None]
 
 
-def _cancel_bluetooth_discovery() -> None:
-    """Cancel active BlueZ discovery via D-Bus CancelDiscovery call.
+def _cancel_bluetooth_discovery(adapter: str = "hci0") -> None:
+    """Cancel active BlueZ discovery and stop LE scan at HCI level.
 
     Most BLE controllers (including Switch 2 Joy-Cons) cannot accept a
     connection while the adapter is actively scanning. GNOME/Steam Deck
     keeps a persistent scan, so we cancel it before connecting.
+
+    Uses btmgmt (HCI-level) when available, falls back to busctl/dbus-send.
     """
+    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
+
+    # HCI-level stop via btmgmt (most reliable)
+    try:
+        subprocess.run(
+            ["sudo", "-n", "btmgmt", "-i", idx, "stop-find", "-l"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        logger.info("btmgmt stop-find succeeded")
+        return
+    except Exception:
+        pass
+
+    # Fallback: busctl StopDiscovery
     try:
         subprocess.run(
             [
-                "dbus-send",
-                "--system",
-                "--dest=org.bluez",
-                "/org/bluez/hci0",
+                "busctl", "call", "org.bluez",
+                f"/org/bluez/{adapter}",
+                "org.bluez.Adapter1", "StopDiscovery",
+            ],
+            capture_output=True, text=True, timeout=3,
+        )
+        logger.info("busctl StopDiscovery succeeded")
+        return
+    except Exception:
+        pass
+
+    # Final fallback: dbus-send
+    try:
+        subprocess.run(
+            [
+                "dbus-send", "--system", "--dest=org.bluez",
+                f"/org/bluez/{adapter}",
                 "org.bluez.Adapter1.CancelDiscovery",
             ],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            capture_output=True, text=True, timeout=2,
         )
-        logger.info("Cancelled BlueZ discovery")
-    except FileNotFoundError:
-        logger.warning("dbus-send not found")
     except Exception:
-        logger.debug("Failed to cancel discovery: %s", _)
+        logger.warning("Failed to cancel BlueZ discovery")
 
 
 class BleConnection:
@@ -102,18 +128,28 @@ class BleConnection:
         logger.info("Connecting to BLE device %s", self._address)
 
         # Cancel active BlueZ scan before connecting
-        _cancel_bluetooth_discovery()
-        await asyncio.sleep(0.5)
+        _cancel_bluetooth_discovery("hci0")
+        await asyncio.sleep(0.3)
 
         self._att = ATTClient(self._address, adapter="hci0")
         self._att.notification_cb = self._on_att_notification
         self._att.disconnect_cb = self._on_att_disconnect
 
-        ok, detail = await asyncio.to_thread(self._att.connect, timeout=10.0, retries=3)
+        # Try multiple times with short timeouts (switch2-controllers-linux uses 0.45s)
+        ok = False
+        errors: list[str] = []
+        for attempt in range(5):
+            ok, detail = await asyncio.to_thread(self._att.connect, timeout=3.0, retries=2)
+            if ok:
+                break
+            errors.append(f"attempt {attempt+1}: {detail}")
+            self._att.close()
+            _cancel_bluetooth_discovery("hci0")
+            await asyncio.sleep(0.3)
         if not ok:
             self._att.close()
             self._att = None
-            raise ConnectionError(f"BLE connection failed: {detail}")
+            raise ConnectionError(f"BLE connection failed: {'; '.join(errors)}")
 
         await asyncio.to_thread(self._resolve_handles)
         self._reconnect_attempts = 0
