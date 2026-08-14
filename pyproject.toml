@@ -15,5 +15,5 @@ dependencies = [
 j2l = "j2l.cli:cli"
 
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
