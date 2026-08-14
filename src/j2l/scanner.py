@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict
 
+import asyncio
+
 from bleak import BleakScanner
 from bleak.exc import BleakDBusError
 
@@ -54,18 +56,23 @@ async def scan(
     """
     results: Dict[str, DeviceInfo] = {}
 
-    async with BleakScanner() as scanner:
+    max_attempts = 2
+    for attempt in range(max_attempts):
         try:
-            devices = await scanner.discover(timeout=timeout, return_on_first_found=False)
+            async with BleakScanner() as scanner:
+                devices = await scanner.discover(timeout=timeout, return_on_first_found=False)
+            break
         except BleakDBusError as e:
             if "InProgress" in str(e):
-                logger.warning(
-                    "BlueZ scan already in progress. "
-                    "Run 'bluetoothctl scan off' and try again."
-                )
+                if attempt < max_attempts - 1:
+                    logger.warning("BlueZ scan conflict, retrying in 1.5s...")
+                    await asyncio.sleep(1.5)
+                    continue
                 raise RuntimeError(
-                    "BLE scan failed: another scanner is already running. "
-                    "Try 'bluetoothctl scan off' first."
+                    "BLE scan failed: BlueZ adapter is busy (another app is scanning).\n"
+                    "On Steam Deck / Bazzite, try:\n"
+                    "  1. Disable Bluetooth auto-scan in system settings, or\n"
+                    "  2. Run 'systemctl --user restart bluetooth' and try again."
                 ) from e
             raise
 
