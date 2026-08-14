@@ -74,24 +74,17 @@ class UinputGamepad:
 
     def _create_device(self) -> None:
         """Instantiate the uinput virtual device."""
-        axes: list[int] = []
-        buttons: list[int] = []
+        # evdev UInput uses an `events` dict: {EV_TYPE: [codes...]}
+        abs_codes = list(ABS_AXES.values()) + list(TRIGGER_AXES.values()) + list(HAT_AXES.values())
+        key_codes = list(BUTTON_MAP.values())
 
-        if self._combined:
-            axes.extend(ABS_AXES.values())
-            axes.extend(TRIGGER_AXES.values())
-            axes.extend(HAT_AXES.values())
-            buttons.extend(BUTTON_MAP.values())
-        else:
-            # Single Joy-Con: half axes + subset of buttons
-            axes.extend(ABS_AXES.values())
-            axes.extend(TRIGGER_AXES.values())
-            axes.extend(HAT_AXES.values())
-            buttons.extend(BUTTON_MAP.values())
+        events = {
+            ecodes.EV_KEY: key_codes,
+            ecodes.EV_ABS: abs_codes,
+        }
 
         self._device = UInput(
-            axes=axes,
-            buttons=buttons,
+            events=events,
             name=self._name,
             bustype=3,  # BUS_USB (evdev latest removed BUSTYPE_USB)
             vendor=0x057E,  # Nintendo
