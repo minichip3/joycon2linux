@@ -29,11 +29,22 @@
 #include <bluetooth/hci_lib.h>
 #include <bluetooth/l2cap.h>
 
+#ifndef ATT_CID
+#define ATT_CID 4  /* Attribute Protocol channel ID */
+#endif
+
+#ifndef LE_SCAN_PASSIVE
+#define LE_SCAN_PASSIVE 1
+#endif
+#ifndef LE_SCAN_ACTIVE
+#define LE_SCAN_ACTIVE 0
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Globals                                                             */
 /* ------------------------------------------------------------------ */
 
-static int g_hci_fd = -1;       /* HCI socket fd */
+static int g_hci_fd = -1;       /* HCI socket fd (reserved) */
 static int g_l2cap_fd = -1;     /* L2CAP socket fd */
 static char g_mac[18];          /* "AA:BB:CC:DD:EE:FF" */
 static int g_adapter_idx = 0;   /* adapter index (hci0 -> 0) */
@@ -85,48 +96,13 @@ static int get_adapter_mac(const char *adapter_name, char *mac_buf, size_t len)
 
 static int hci_stop_le_scan(int dev_id)
 {
-    /* Use BlueZ HCI library directly */
-    uint8_t scan = 0x00; /* scan disabled */
-    le_set_scan_cp cp;
-    memset(&cp, 0, sizeof(cp));
-    cp.type = scan;
-    cp.ointerval = htobs(0x0010);
-    cp.opwindow = htobs(0x0010);
-    cp.filter = htobs(0x0000);
-
-    uint8_t status = hci_le_set_scan(dev_id, 1000, &cp);
-    return (status == 0) ? 0 : -1;
-}
-
-/* ------------------------------------------------------------------ */
-/* HCI: LE Create Connection                                           */
-/* ------------------------------------------------------------------ */
-
-static int hci_le_create_connection(int dev_id, bdaddr_t *dst,
-                                    uint8_t dst_type, uint8_t *acl_handle)
-{
-    le_create_conn_cp cp;
-    memset(&cp, 0, sizeof(cp));
-
-    cp.lla_type = dst_type;
-    cp.lla = *dst;
-    cp.own_lladdr_type = LE_PUBLIC_ADDRESS;
-    cp.min_interval = htobs(0x0020);  /* 15.0ms */
-    cp.max_interval = htobs(0x0040);  /* 30.0ms */
-    cp.latency = htobs(0x0000);
-    cp.superv_timeout = htobs(0x00c8); /* 2560ms */
-    cp.min_ce_len = htobs(0x0000);
-    cp.max_ce_len = htobs(0x0000);
-
-    le_create_conn_rp rp;
-    memset(&rp, 0, sizeof(rp));
-
-    uint8_t status = hci_le_create_conn(dev_id, 5000, &cp, &rp);
-    if (status != 0) {
+    /* Set scan parameters (passive, no filtering) */
+    if (hci_le_set_scan_parameters(dev_id, LE_SCAN_PASSIVE, htobs(0x0010),
+                                   htobs(0x0010), LE_PUBLIC_ADDRESS, 0, 1000) < 0)
         return -1;
-    }
-
-    *acl_handle = rp.handle;
+    /* Disable scanning */
+    if (hci_le_set_scan_enable(dev_id, 0, 0, 1000) < 0)
+        return -1;
     return 0;
 }
 
@@ -134,7 +110,7 @@ static int hci_le_create_connection(int dev_id, bdaddr_t *dst,
 /* L2CAP: Connect                                                      */
 /* ------------------------------------------------------------------ */
 
-static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, int *acl_handle)
+static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, uint16_t *acl_handle)
 {
     struct sockaddr_l2 addr = {0};
     addr.l2_family = AF_BLUETOOTH;
@@ -143,7 +119,7 @@ static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, int *acl_handle)
     bacpy(&addr.l2_bdaddr, dst);
 
     /* Set dst_type in sockaddr */
-    addr.l2_addr_type = dst_type;
+    addr.l2_bdaddr_type = dst_type;
 
     int fd = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
     if (fd < 0) return -1;
@@ -160,7 +136,7 @@ static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, int *acl_handle)
     bdaddr_t adapter_ba;
     parse_mac(mac_str, &adapter_ba);
     bacpy(&bind_addr.l2_bdaddr, &adapter_ba);
-    bind_addr.l2_addr_type = LE_PUBLIC_ADDRESS;
+    bind_addr.l2_bdaddr_type = LE_PUBLIC_ADDRESS;
 
     if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
         close(fd);
@@ -195,14 +171,14 @@ static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, int *acl_handle)
     }
 
     /* Get ACL handle */
-    hci_conn_info_req *creq = malloc(offsetof(hci_conn_info_req, info) + sizeof(hci_conn_info));
-    memset(creq, 0, sizeof(hci_conn_info_req) + sizeof(hci_conn_info));
+    struct hci_conn_info_req *creq = malloc(sizeof(struct hci_conn_info_req) + sizeof(struct hci_conn_info));
+    memset(creq, 0, sizeof(struct hci_conn_info_req) + sizeof(struct hci_conn_info));
     creq->type = ACL_LINK;
     bacpy(&creq->bdaddr, dst);
 
     if (ioctl(fd, HCIGETCONNINFO, (unsigned long)creq) == 0) {
         if (acl_handle)
-            *acl_handle = creq->info.handle;
+            *acl_handle = creq->conn_info[0].handle;
     }
     free(creq);
 
@@ -361,19 +337,9 @@ static PyObject *ble_connect(PyObject *self, PyObject *args)
     /* Stop LE scan */
     hci_stop_le_scan(dev_id);
 
-    /* Try LE Create Connection first */
-    uint8_t acl_handle = 0;
-    int dst_types[2] = {LE_RANDOM_ADDRESS, LE_PUBLIC_ADDRESS};
-    int hci_ok = 0;
-
-    for (int i = 0; i < 2; i++) {
-        if (hci_le_create_connection(dev_id, &dst, dst_types[i], &acl_handle) == 0) {
-            hci_ok = 1;
-            break;
-        }
-    }
-
     /* L2CAP connect */
+    uint16_t acl_handle = 0;
+    int dst_types[2] = {LE_RANDOM_ADDRESS, LE_PUBLIC_ADDRESS};
     int fd = -1;
     for (int i = 0; i < 2; i++) {
         fd = l2cap_connect(&dst, dst_types[i], &acl_handle);
@@ -426,7 +392,7 @@ static PyObject *ble_write(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "IO", &handle, &data_obj))
         return NULL;
 
-    const char *data;
+    char *data;
     Py_ssize_t len;
     if (!PyBytes_AsStringAndSize(data_obj, &data, &len))
         return NULL;
@@ -452,7 +418,7 @@ static PyObject *ble_write_req(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "IO", &handle, &data_obj))
         return NULL;
 
-    const char *data;
+    char *data;
     Py_ssize_t len;
     if (!PyBytes_AsStringAndSize(data_obj, &data, &len))
         return NULL;
@@ -520,7 +486,7 @@ static PyObject *ble_discover_services(PyObject *self, PyObject *args)
 
     char buf[4096];
     memset(buf, 0, sizeof(buf));
-    int n = att_discover_services(g_l2cap_fd, buf, sizeof(buf));
+    (void)att_discover_services(g_l2cap_fd, buf, sizeof(buf));
     return PyUnicode_FromString(buf);
 }
 
@@ -564,9 +530,8 @@ static struct PyModuleDef ble_module = {
     BleMethods
 };
 
-PyMODINIT_FUNC PyInit_ble(void)
+PyMODINIT_FUNC PyInit__ble(void)
 {
+    (void)g_hci_fd;  /* reserved for future use */
     return PyModule_Create(&ble_module);
 }
-
-PyMODINIT_FUNC PyInit__ble(void)

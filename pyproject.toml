@@ -16,8 +16,6 @@ j2l = "j2l.cli:cli"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[[tool.setuptools.ext-modules]]
-name = "j2l._ble"
-sources = ["src/j2l/_ble.c"]
-include-dirs = ["src/j2l/cinclude"]
-libraries = ["bluetooth"]
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
