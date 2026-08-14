@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Dict
 
 import asyncio
+import subprocess
 
 from bleak import BleakScanner
 from bleak.exc import BleakDBusError
@@ -56,11 +57,16 @@ async def scan(
     """
     results: Dict[str, DeviceInfo] = {}
 
+    # --- Try bleak active scan (may conflict with desktop BlueZ) ----------
+    bleak_worked = False
     max_attempts = 2
     for attempt in range(max_attempts):
         try:
             async with BleakScanner() as scanner:
-                devices = await scanner.discover(timeout=timeout, return_on_first_found=False)
+                devices = await scanner.discover(
+                    timeout=timeout, return_on_first_found=False, passive=True
+                )
+            bleak_worked = True
             break
         except BleakDBusError as e:
             if "InProgress" in str(e):
@@ -68,13 +74,24 @@ async def scan(
                     logger.warning("BlueZ scan conflict, retrying in 1.5s...")
                     await asyncio.sleep(1.5)
                     continue
-                raise RuntimeError(
-                    "BLE scan failed: BlueZ adapter is busy (another app is scanning).\n"
-                    "On Steam Deck / Bazzite, try:\n"
-                    "  1. Disable Bluetooth auto-scan in system settings, or\n"
-                    "  2. Run 'systemctl --user restart bluetooth' and try again."
-                ) from e
+                logger.info("BlueZ D-Bus busy — falling back to hcitool")
+                break
             raise
+
+    # --- Parse bleak results (if it worked) -------------------------------
+    if bleak_worked:
+        for dev in devices:
+            info = _classify_device(dev)
+            if info is not None:
+                mac = dev.address.lower()
+                results[mac] = info
+
+    # --- Fallback: hcitool lescan (avoids D-Bus conflict) -----------------
+    if not bleak_worked and not results:
+        results = _scan_with_hcitool(timeout=timeout)
+
+    logger.info("BLE scan complete — found %d controller(s)", len(results))
+    return results
 
     for dev in devices:
         info = _classify_device(dev)
@@ -122,6 +139,41 @@ def _classify_device(dev) -> DeviceInfo | None:
     rssi = getattr(dev, "rssi", -127)
 
     return DeviceInfo(name=name, rssi=rssi, type=type_)
+
+
+def _scan_with_hcitool(timeout: int = 10) -> Dict[str, DeviceInfo]:
+    """Fallback scanner using hcitool (avoids BlueZ D-Bus conflicts)."""
+    results: Dict[str, DeviceInfo] = {}
+
+    try:
+        proc = subprocess.run(
+            ["hcitool", "lescan", "--passive"],
+            capture_output=True, text=True, timeout=timeout + 5,
+        )
+        # hcitool lescan scans for ~10s and returns; parse discovered devices
+        lines = proc.stdout.strip().splitlines()
+        for line in lines:
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                continue
+            mac = parts[0].lower()
+            name = parts[1]
+            # Check if it looks like a Nintendo controller
+            name_lower = name.lower()
+            if "joy-con" in name_lower or "pro controller" in name_lower:
+                type_ = ControllerType.PRO_CONTROLLER2
+                if "left" in name_lower:
+                    type_ = ControllerType.JOYCON2_LEFT
+                elif "right" in name_lower:
+                    type_ = ControllerType.JOYCON2_RIGHT
+                results[mac] = DeviceInfo(name=name, rssi=-1, type=type_)
+                logger.info("hcitool found: %s %s (%s)", mac, name, type_.value)
+    except FileNotFoundError:
+        logger.warning("hcitool not found; cannot fallback scan")
+    except subprocess.TimeoutExpired:
+        logger.warning("hcitool scan timed out after %ds", timeout)
+
+    return results
 
 
 def _infer_type(dev) -> ControllerType:
