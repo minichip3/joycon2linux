@@ -139,57 +139,59 @@ async def _scan_with_bluetoothctl(timeout: int = 10) -> Dict[str, DeviceInfo]:
         proc.stdin.flush()
         stdout, _ = proc.communicate(timeout=5)
 
-        # Parse [NEW] lines — collect ALL devices first
+        # Parse stdout: collect devices + Nintendo manufacturer data from [CHG]
         all_devices: Dict[str, str] = {}  # mac -> name
+        nintendo_macs: set[str] = set()
+
         for line in stdout.strip().splitlines():
             line = line.strip()
-            if not line.startswith("[NEW]"):
-                continue
-            parts = line.split()
-            # [NEW] Device AA:BB:CC:DD:EE:FF Name
-            if len(parts) < 4:
-                continue
-            mac_raw = parts[2]
-            if ":" not in mac_raw or len(mac_raw) != 17:
-                continue
-            all_devices[mac_raw.lower()] = parts[3]
 
-        # Filter for Nintendo controllers
-        # Joy-Con 2 may advertise with MAC as name, so we check manufacturer data
+            # [NEW] Device AA:BB:CC:DD:EE:FF Name
+            if line.startswith("[NEW]"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    mac_candidate = parts[2]
+                    if ":" in mac_candidate and len(mac_candidate) == 17:
+                        all_devices[mac_candidate.lower()] = parts[3]
+
+            # [CHG] Device AA:BB:CC:DD:EE:FF ManufacturerData.Key: 0x0553
+            elif "ManufacturerData" in line and "0x0553" in line:
+                # Parse MAC from this [CHG] line
+                chg_parts = line.split()
+                for i, part in enumerate(chg_parts):
+                    if part == "Device" and i + 1 < len(chg_parts):
+                        cand = chg_parts[i + 1]
+                        if ":" in cand and len(cand) == 17:
+                            nintendo_macs.add(cand.lower())
+                            break
+
+        # Build results: name match OR Nintendo mfr data
         for mac_raw, name in all_devices.items():
             name_lower = name.lower()
+            type_ = ControllerType.PRO_CONTROLLER2
+            is_nintendo = False
+
             # Direct name match
             if "joy-con" in name_lower or "pro controller" in name_lower:
-                type_ = ControllerType.PRO_CONTROLLER2
+                is_nintendo = True
                 if "left" in name_lower:
                     type_ = ControllerType.JOYCON2_LEFT
                 elif "right" in name_lower:
                     type_ = ControllerType.JOYCON2_RIGHT
-                results[mac_raw] = DeviceInfo(name=name, rssi=-1, type=type_)
-                logger.info("Found by name: %s %s (%s)", mac_raw, name, type_.value)
-                continue
 
-            # Check if device has Nintendo manufacturer data via bluetoothctl info
-            try:
-                info_out = subprocess.run(
-                    ["bluetoothctl", "info", mac_raw.upper()],
-                    capture_output=True, text=True, timeout=3, env=env,
-                )
-                for info_line in info_out.stdout.splitlines():
-                    # ManufacturerData key: 0x0553 = Nintendo
-                    if "ManufacturerData" in info_line and "0x0553" in info_line:
-                        # Found Nintendo device
-                        type_ = ControllerType.PRO_CONTROLLER2
-                        results[mac_raw] = DeviceInfo(name=name, rssi=-1, type=type_)
-                        logger.info("Found via mfr ID: %s %s", mac_raw, name)
-                        break
-            except Exception:
-                pass
+            # Nintendo manufacturer data (0x0553)
+            if mac_raw in nintendo_macs:
+                is_nintendo = True
+
+            if is_nintendo:
+                results[mac_raw] = DeviceInfo(name=name, rssi=-1, type=type_)
+                logger.info("Found: %s %s (%s)", mac_raw, name, type_.value)
 
     except FileNotFoundError:
         logger.warning("bluetoothctl not found")
     except Exception as e:
         logger.warning("bluetoothctl scan failed: %s", e)
+        proc.kill()
 
     logger.info("BLE scan complete — found %d controller(s)", len(results))
     return results
