@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libbluetooth-dev python3-dev pkg-config
+
+      - name: Install package (editable)
+        run: |
+          pip install -e .
+
+      - name: Verify build
+        run: |
+          python -c "from j2l import _ble; print('C extension OK')"
+          python -c "from j2l.ble import BleConnection; print('BleConnection OK')"
+
+      - name: Check imports
+        run: |
+          python -c "from j2l.protocol import *; print('protocol OK')"
+          python -c "from j2l.mapper import *; print('mapper OK')"
+          python -c "from j2l.gamepad import *; print('gamepad OK')"
+          python -c "from j2l.cli import cli; print('cli OK')"
+
+      - name: Check installed files
+        run: |
+          pip show joycon2linux
+          python -c "import j2l; print(j2l.__file__)"
+          ls -la $(python -c "import j2l; import os; print(os.path.dirname(j2l.__file__))")/*.so

@@ -20,6 +20,5 @@ packages = ["j2l"]
 _ble = {
     sources = ["src/j2l/_ble.c"],
     include-dirs = ["src/j2l/cinclude"],
-    library-dirs = [],
     libraries = ["bluetooth"],
 }
