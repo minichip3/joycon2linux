@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from evdev import ecodes
-from evdev import InputEvent
-
 from j2l.protocol import Buttons, InputReport
 
 # ---------------------------------------------------------------------------
@@ -98,16 +96,16 @@ def joycon_to_evdev(report: InputReport, prev_buttons: int = 0) -> list[InputEve
         (report.ry, ecodes.ABS_RY),
     ]
     for raw, code in axis_map:
-        events.append(InputEvent(event=ecodes.EV_ABS, code=code, value=_map_stick(raw)))
+        events.append((ecodes.EV_ABS, code, _map_stick(raw)))
 
     # ---- Trigger axes -----------------------------------------------------
-    events.append(InputEvent(event=ecodes.EV_ABS, code=ecodes.ABS_Z, value=_map_trigger(report.trigger_l)))
-    events.append(InputEvent(event=ecodes.EV_ABS, code=ecodes.ABS_RZ, value=_map_trigger(report.trigger_r)))
+    events.append((ecodes.EV_ABS, ecodes.ABS_Z, _map_trigger(report.trigger_l)))
+    events.append((ecodes.EV_ABS, ecodes.ABS_RZ, _map_trigger(report.trigger_r)))
 
     # ---- D-pad → HAT ------------------------------------------------------
     h_x, h_y = _dpad_to_hat(report.buttons)
-    events.append(InputEvent(event=ecodes.EV_ABS, code=ecodes.ABS_HAT0X, value=h_x))
-    events.append(InputEvent(event=ecodes.EV_ABS, code=ecodes.ABS_HAT0Y, value=h_y))
+    events.append((ecodes.EV_ABS, ecodes.ABS_HAT0X, h_x))
+    events.append((ecodes.EV_ABS, ecodes.ABS_HAT0Y, h_y))
 
     # ---- Button edges -----------------------------------------------------
     for name, mask in Buttons._ALL.items():
@@ -120,6 +118,6 @@ def joycon_to_evdev(report: InputReport, prev_buttons: int = 0) -> list[InputEve
         evdev_code = BUTTON_TO_EVDEV.get(mask)
         if evdev_code is None:
             continue
-        events.append(InputEvent(event=ecodes.EV_KEY, code=evdev_code, value=1 if btn_pressed else 0))
+        events.append((ecodes.EV_KEY, evdev_code, 1 if btn_pressed else 0))
 
     return events
