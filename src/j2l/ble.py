@@ -29,21 +29,23 @@ RECONNECT_DELAY_SECONDS = 2.0
 NotifyCallback = Callable[[bytes], None]
 
 
-def _cancel_bluetooth_discovery(adapter: str = "hci0") -> None:
-    """Cancel active BlueZ discovery and stop LE scan at HCI level.
+def _stop_le_scan(adapter: str = "hci0") -> None:
+    """Stop LE scan at HCI level so raw L2CAP connect succeeds.
 
-    Most BLE controllers (including Switch 2 Joy-Cons) cannot accept a
-    connection while the adapter is actively scanning. GNOME/Steam Deck
-    keeps a persistent scan, so we cancel it before connecting.
+    Switch 2 controllers can't accept a connection while the adapter is
+    scanning. Steam Deck / Bazzite keeps persistent scans alive.
 
-    Uses btmgmt (HCI-level) when available, falls back to busctl/dbus-send.
+    Priority:
+      1. btmgmt stop-find -l   (HCI-level, most reliable)
+      2. busctl StopDiscovery  (D-Bus)
+      3. dbus-send CancelDiscovery (legacy D-Bus)
     """
     idx = adapter.replace("hci", "") if "hci" in adapter else "0"
 
-    # HCI-level stop via btmgmt (most reliable)
+    # 1. btmgmt (HCI-level — stops Steam/decky persistent scans)
     try:
         subprocess.run(
-            ["sudo", "-n", "btmgmt", "-i", idx, "stop-find", "-l"],
+            ["btmgmt", "-i", idx, "stop-find", "-l"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=2,
@@ -53,7 +55,7 @@ def _cancel_bluetooth_discovery(adapter: str = "hci0") -> None:
     except Exception:
         pass
 
-    # Fallback: busctl StopDiscovery
+    # 2. busctl
     try:
         subprocess.run(
             [
@@ -68,7 +70,7 @@ def _cancel_bluetooth_discovery(adapter: str = "hci0") -> None:
     except Exception:
         pass
 
-    # Final fallback: dbus-send
+    # 3. dbus-send
     try:
         subprocess.run(
             [
@@ -79,7 +81,108 @@ def _cancel_bluetooth_discovery(adapter: str = "hci0") -> None:
             capture_output=True, text=True, timeout=2,
         )
     except Exception:
-        logger.warning("Failed to cancel BlueZ discovery")
+        pass
+
+    logger.warning("Could not stop LE scan")
+
+
+def _btmgmt_stop_find(adapter: str = "hci0") -> None:
+    """Stop discovery at HCI level via btmgmt."""
+    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
+    try:
+        subprocess.run(
+            ["btmgmt", "-i", idx, "stop-find", "-l"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        logger.info("btmgmt stop-find succeeded")
+    except Exception:
+        pass
+
+
+def _btmgmt_disconnect(mac: str, adapter: str = "hci0") -> None:
+    """Disconnect a device via btmgmt."""
+    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
+    try:
+        subprocess.run(
+            ["btmgmt", "-i", idx, "disconnect", mac],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        logger.info("btmgmt disconnect succeeded for %s", mac)
+    except Exception:
+        pass
+
+
+def _btmgmt_unpair(mac: str, adapter: str = "hci0") -> None:
+    """Remove pairing info via btmgmt."""
+    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
+    try:
+        subprocess.run(
+            ["btmgmt", "-i", idx, "--timeout", "3", "unpair", mac],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        logger.info("btmgmt unpair succeeded for %s", mac)
+    except Exception:
+        pass
+
+
+def _hci_le_create_connection(mac: str, adapter: str = "hci0") -> bool:
+    """Send HCI LE Create Connection command directly.
+
+    This creates the LE ACL link at the HCI controller level,
+    so subsequent raw L2CAP connect() will succeed immediately.
+
+    Uses btmgmt hci-cmd to send the HCI command.
+    """
+    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
+    # HCI LE Create Connection: opcode 0x08 0x0009
+    # Parameters:
+    #   LE Role: 0x00 (central)
+    #   Scan interval: 0x0004
+    #   Scan window: 0x0004
+    #   Filter policy: 0x00
+    #   Peer address type: 0x01 (random)
+    #   Peer address: 6 bytes (little-endian)
+    #   Connection interval min: 0x0020
+    #   Connection interval max: 0x0040
+    #   Latency: 0x0000
+    #   Supervision timeout: 0x00C8
+    #   Own address type: 0x00 (public)
+    import struct
+    addr_bytes = bytes(int(x, 16) for x in reversed(mac.split(":")))
+    param = struct.pack("<BBHHB6sHHHHB",
+        0x00,  # LE Role: central
+        0x0004,  # Scan interval
+        0x0004,  # Scan window
+        0x00,    # Filter policy
+        0x01,    # Peer addr type: random
+        addr_bytes,
+        0x0020,  # Conn interval min
+        0x0040,  # Conn interval max
+        0x0000,  # Latency
+        0x00C8,  # Supervision timeout
+        0x00,    # Own addr type: public
+    )
+    # Convert to hex string for btmgmt hci-cmd
+    param_hex = param.hex().upper()
+    try:
+        result = subprocess.run(
+            ["btmgmt", "-i", idx, "hci-cmd", "0x08", "0x0009", param_hex],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            logger.info("HCI LE Create Connection succeeded")
+            time.sleep(0.5)  # Wait for link to establish
+            return True
+        logger.info("HCI LE Create Connection failed: %s", result.stdout.strip())
+    except Exception as e:
+        logger.warning("HCI LE Create Connection error: %s", e)
+    return False
 
 
 class BleConnection:
@@ -127,25 +230,34 @@ class BleConnection:
 
         logger.info("Connecting to BLE device %s", self._address)
 
-        # Cancel active BlueZ scan before connecting
-        _cancel_bluetooth_discovery("hci0")
-        await asyncio.sleep(0.3)
+        # 1. Stop LE scan at HCI level
+        _btmgmt_stop_find("hci0")
+        _stop_le_scan("hci0")
+        await asyncio.sleep(0.2)
 
+        # 2. Try HCI LE Create Connection first (most reliable)
+        hci_ok = await asyncio.to_thread(_hci_le_create_connection, self._address, "hci0")
+        if hci_ok:
+            logger.info("HCI connection established, proceeding to L2CAP")
+
+        # 3. Raw L2CAP ATT connect with retries
         self._att = ATTClient(self._address, adapter="hci0")
         self._att.notification_cb = self._on_att_notification
         self._att.disconnect_cb = self._on_att_disconnect
 
-        # Try multiple times with short timeouts (switch2-controllers-linux uses 0.45s)
         ok = False
         errors: list[str] = []
         for attempt in range(5):
-            ok, detail = await asyncio.to_thread(self._att.connect, timeout=3.0, retries=2)
+            if not hci_ok:
+                # Re-stop scan before each attempt
+                _btmgmt_stop_find("hci0")
+                await asyncio.sleep(0.1)
+            ok, detail = await asyncio.to_thread(self._att.connect, timeout=2.0, retries=1)
             if ok:
                 break
             errors.append(f"attempt {attempt+1}: {detail}")
             self._att.close()
-            _cancel_bluetooth_discovery("hci0")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         if not ok:
             self._att.close()
             self._att = None
