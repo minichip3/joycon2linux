@@ -131,60 +131,6 @@ def _btmgmt_unpair(mac: str, adapter: str = "hci0") -> None:
         pass
 
 
-def _hci_le_create_connection(mac: str, adapter: str = "hci0") -> bool:
-    """Send HCI LE Create Connection command directly.
-
-    This creates the LE ACL link at the HCI controller level,
-    so subsequent raw L2CAP connect() will succeed immediately.
-
-    Uses btmgmt hci-cmd to send the HCI command.
-    """
-    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
-    # HCI LE Create Connection: opcode 0x08 0x0009
-    # Parameters:
-    #   LE Role: 0x00 (central)
-    #   Scan interval: 0x0004
-    #   Scan window: 0x0004
-    #   Filter policy: 0x00
-    #   Peer address type: 0x01 (random)
-    #   Peer address: 6 bytes (little-endian)
-    #   Connection interval min: 0x0020
-    #   Connection interval max: 0x0040
-    #   Latency: 0x0000
-    #   Supervision timeout: 0x00C8
-    #   Own address type: 0x00 (public)
-    import struct
-    addr_bytes = bytes(int(x, 16) for x in reversed(mac.split(":")))
-    param = struct.pack("<BBHHB6sHHHHB",
-        0x00,  # LE Role: central
-        0x0004,  # Scan interval
-        0x0004,  # Scan window
-        0x00,    # Filter policy
-        0x01,    # Peer addr type: random
-        addr_bytes,
-        0x0020,  # Conn interval min
-        0x0040,  # Conn interval max
-        0x0000,  # Latency
-        0x00C8,  # Supervision timeout
-        0x00,    # Own addr type: public
-    )
-    # Convert to hex string for btmgmt hci-cmd
-    param_hex = param.hex().upper()
-    try:
-        result = subprocess.run(
-            ["btmgmt", "-i", idx, "hci-cmd", "0x08", "0x0009", param_hex],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            logger.info("HCI LE Create Connection succeeded")
-            time.sleep(0.5)  # Wait for link to establish
-            return True
-        logger.info("HCI LE Create Connection failed: %s", result.stdout.strip())
-    except Exception as e:
-        logger.warning("HCI LE Create Connection error: %s", e)
-    return False
-
-
 class BleConnection:
     """Manage a BLE connection to a Switch 2 controller via raw L2CAP ATT."""
 
@@ -235,29 +181,29 @@ class BleConnection:
         _stop_le_scan("hci0")
         await asyncio.sleep(0.2)
 
-        # 2. Try HCI LE Create Connection first (most reliable)
-        hci_ok = await asyncio.to_thread(_hci_le_create_connection, self._address, "hci0")
-        if hci_ok:
-            logger.info("HCI connection established, proceeding to L2CAP")
+        # 2. Clean up any stale BlueZ device info
+        _btmgmt_disconnect(self._address, "hci0")
+        await asyncio.sleep(0.1)
+        _btmgmt_unpair(self._address, "hci0")
+        await asyncio.sleep(0.2)
 
-        # 3. Raw L2CAP ATT connect with retries
+        # 3. Raw L2CAP ATT connect with aggressive retries
+        # Each attempt: stop-find → 100ms delay → connect
         self._att = ATTClient(self._address, adapter="hci0")
         self._att.notification_cb = self._on_att_notification
         self._att.disconnect_cb = self._on_att_disconnect
 
         ok = False
         errors: list[str] = []
-        for attempt in range(5):
-            if not hci_ok:
-                # Re-stop scan before each attempt
-                _btmgmt_stop_find("hci0")
-                await asyncio.sleep(0.1)
+        for attempt in range(10):
+            _btmgmt_stop_find("hci0")
+            await asyncio.sleep(0.1)
             ok, detail = await asyncio.to_thread(self._att.connect, timeout=2.0, retries=1)
             if ok:
                 break
             errors.append(f"attempt {attempt+1}: {detail}")
             self._att.close()
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
         if not ok:
             self._att.close()
             self._att = None
