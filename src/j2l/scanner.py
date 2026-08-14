@@ -86,9 +86,9 @@ async def scan(
                 mac = dev.address.lower()
                 results[mac] = info
 
-    # --- Fallback: hcitool lescan (avoids D-Bus conflict) -----------------
+    # --- Fallback: bluetoothctl (avoids D-Bus conflict) --------------------
     if not bleak_worked and not results:
-        results = _scan_with_hcitool(timeout=timeout)
+        results = _scan_with_bluetoothctl(timeout=timeout)
 
     logger.info("BLE scan complete — found %d controller(s)", len(results))
     return results
@@ -141,37 +141,68 @@ def _classify_device(dev) -> DeviceInfo | None:
     return DeviceInfo(name=name, rssi=rssi, type=type_)
 
 
-def _scan_with_hcitool(timeout: int = 10) -> Dict[str, DeviceInfo]:
-    """Fallback scanner using hcitool (avoids BlueZ D-Bus conflicts)."""
+def _scan_with_bluetoothctl(timeout: int = 10) -> Dict[str, DeviceInfo]:
+    """Fallback scanner using bluetoothctl CLI (avoids BlueZ D-Bus conflicts).
+    
+    bluetoothctl is pre-installed on Steam Deck / Bazzite and uses its own
+    internal D-Bus connection, so it doesn't conflict with bleak.
+    """
     results: Dict[str, DeviceInfo] = {}
 
     try:
-        proc = subprocess.run(
-            ["hcitool", "lescan", "--passive"],
-            capture_output=True, text=True, timeout=timeout + 5,
+        # Run bluetoothctl scan, wait for timeout, then list devices
+        # We use a non-interactive approach: scan on/off with timeout
+        import select
+        
+        proc = subprocess.Popen(
+            ["bluetoothctl", "--timeout", str(timeout)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
         )
-        # hcitool lescan scans for ~10s and returns; parse discovered devices
-        lines = proc.stdout.strip().splitlines()
-        for line in lines:
-            parts = line.strip().split(maxsplit=1)
+        # Send scan commands
+        proc.stdin.write("scan on\n")
+        proc.stdin.flush()
+        
+        # Wait for scan duration
+        proc.stdin.write(f"exit\n")
+        proc.stdin.flush()
+        stdout, _ = proc.communicate(timeout=timeout + 10)
+        
+        # Parse discovered devices from output
+        # Format: "<MAC> <Name>" lines in scan output
+        for line in stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Skip non-device lines
+            if line.startswith("[NEW]") or "Scanning" in line or "Discovery" in line:
+                continue
+            parts = line.split(maxsplit=1)
             if len(parts) < 2:
                 continue
-            mac = parts[0].lower()
+            mac_candidate = parts[0].upper()
+            # Validate MAC format (XX:XX:XX:XX:XX:XX)
+            if ":" not in mac_candidate or len(mac_candidate) != 17:
+                continue
             name = parts[1]
-            # Check if it looks like a Nintendo controller
             name_lower = name.lower()
             if "joy-con" in name_lower or "pro controller" in name_lower:
+                mac = mac_candidate.lower()
                 type_ = ControllerType.PRO_CONTROLLER2
                 if "left" in name_lower:
                     type_ = ControllerType.JOYCON2_LEFT
                 elif "right" in name_lower:
                     type_ = ControllerType.JOYCON2_RIGHT
                 results[mac] = DeviceInfo(name=name, rssi=-1, type=type_)
-                logger.info("hcitool found: %s %s (%s)", mac, name, type_.value)
+                logger.info("bluetoothctl found: %s %s (%s)", mac, name, type_.value)
+                
     except FileNotFoundError:
-        logger.warning("hcitool not found; cannot fallback scan")
+        logger.warning("bluetoothctl not found; cannot fallback scan")
     except subprocess.TimeoutExpired:
-        logger.warning("hcitool scan timed out after %ds", timeout)
+        proc.kill()
+        logger.warning("bluetoothctl scan timed out after %ds", timeout)
+    except Exception as e:
+        logger.warning("bluetoothctl fallback failed: %s", e)
 
     return results
 
