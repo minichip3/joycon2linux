@@ -101,34 +101,101 @@ def _btmgmt_stop_find(adapter: str = "hci0") -> None:
         pass
 
 
-def _btmgmt_disconnect(mac: str, adapter: str = "hci0") -> None:
-    """Disconnect a device via btmgmt."""
-    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
-    try:
-        subprocess.run(
-            ["btmgmt", "-i", idx, "disconnect", mac],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        )
-        logger.info("btmgmt disconnect succeeded for %s", mac)
-    except Exception:
-        pass
+def _hci_le_create_connection(mac: str, adapter: str = "hci0") -> bool:
+    """Create LE ACL link via raw HCI socket.
 
+    Opens an HCI socket, sends LE Create Connection command,
+    and waits for the event. Returns True if the HCI link
+    was established.
 
-def _btmgmt_unpair(mac: str, adapter: str = "hci0") -> None:
-    """Remove pairing info via btmgmt."""
-    idx = adapter.replace("hci", "") if "hci" in adapter else "0"
+    This bypasses btmgmt/BlueZ entirely and talks directly to
+    the Bluetooth controller, avoiding scan conflicts.
+    """
+    import struct
+    import ctypes
+    import fcntl
+    import os
+
+    HCI_DEV_ID = 0x04  # HCI_DEV_ID command
+    HCI_OP_LE_CREATE_CONN = 0x0009
+    HCI_OGF_LE = 0x08
+    HCI_COMMAND_PKT = 1
+
     try:
-        subprocess.run(
-            ["btmgmt", "-i", idx, "--timeout", "3", "unpair", mac],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
+        # Open HCI socket
+        import socket as _socket
+        hci_sock = _socket.socket(_socket.AF_BLUETOOTH,
+                                   _socket.SOCK_RAW,
+                                   _socket.BTPROTO_HCI)
+
+        # Get adapter index
+        idx = int(adapter.replace("hci", "")) if "hci" in adapter else 0
+
+        # Bind to adapter
+        hci_addr = struct.pack("IHH", idx, 0, 0)
+        hci_sock.bind(hci_addr)
+        hci_sock.setblocking(True)
+        hci_sock.settimeout(5.0)
+
+        # Send LE Create Connection
+        # HCI command header: ogf(2) + ocf(7) + plen(16)
+        # LE Create Connection parameters:
+        addr_bytes = bytes(int(x, 16) for x in reversed(mac.split(":")))
+        params = struct.pack("<BBHHB6sHHHHB",
+            0x00,  # LE Role: central
+            0x0004,  # Scan interval
+            0x0004,  # Scan window
+            0x00,    # Filter policy
+            0x01,    # Peer addr type: random
+            addr_bytes,
+            0x0020,  # Conn interval min
+            0x0040,  # Conn interval max
+            0x0000,  # Latency
+            0x00C8,  # Supervision timeout
+            0x00,    # Own addr type: public
         )
-        logger.info("btmgmt unpair succeeded for %s", mac)
-    except Exception:
-        pass
+        plen = len(params)
+        cmd_hdr = struct.pack("<HH", HCI_OGF << 2 | 0, HCI_OP_LE_CREATE_CONN)
+        cmd = struct.pack("<B", plen) + cmd_hdr + params
+
+        hci_sock.send(cmd)
+        logger.info("Sent HCI LE Create Connection for %s", mac)
+
+        # Wait for HCI event
+        try:
+            event = hci_sock.recv(256)
+            if len(event) >= 3:
+                evt_type = event[0]
+                evt_code = event[1]
+                evt_status = event[2]
+                if evt_type == 4:  # HCI_EVENT_PKT
+                    if evt_code == 0x00:  # LE Connection Complete Event
+                        if evt_status == 0:
+                            logger.info("HCI LE connection established")
+                            hci_sock.close()
+                            return True
+                        else:
+                            logger.info("HCI LE connection failed: status %02x", evt_status)
+                    else:
+                        logger.info("Got unexpected HCI event: code %02x", evt_code)
+                else:
+                    logger.info("Got non-event HCI packet: type %02x", evt_type)
+            else:
+                logger.info("HCI recv too short: %d bytes", len(event))
+        except _socket.timeout:
+            logger.info("HCI LE connection timed out")
+        except Exception as e:
+            logger.info("HCI recv error: %s", e)
+        finally:
+            try:
+                hci_sock.close()
+            except Exception:
+                pass
+        return False
+
+    except Exception as e:
+        logger.info("HCI socket error: %s", e)
+        return False
 
 
 class BleConnection:
@@ -181,23 +248,24 @@ class BleConnection:
         _stop_le_scan("hci0")
         await asyncio.sleep(0.2)
 
-        # 2. Clean up any stale BlueZ device info
-        _btmgmt_disconnect(self._address, "hci0")
-        await asyncio.sleep(0.1)
-        _btmgmt_unpair(self._address, "hci0")
-        await asyncio.sleep(0.2)
+        # 2. Try raw HCI LE Create Connection (most reliable)
+        hci_ok = await asyncio.to_thread(_hci_le_create_connection, self._address, "hci0")
+        if hci_ok:
+            logger.info("HCI connection established, proceeding to L2CAP")
+            await asyncio.sleep(0.3)
 
-        # 3. Raw L2CAP ATT connect with aggressive retries
-        # Each attempt: stop-find → 100ms delay → connect
+        # 3. Raw L2CAP ATT connect
         self._att = ATTClient(self._address, adapter="hci0")
         self._att.notification_cb = self._on_att_notification
         self._att.disconnect_cb = self._on_att_disconnect
 
         ok = False
         errors: list[str] = []
-        for attempt in range(10):
-            _btmgmt_stop_find("hci0")
-            await asyncio.sleep(0.1)
+        max_attempts = 3 if hci_ok else 8
+        for attempt in range(max_attempts):
+            if not hci_ok:
+                _btmgmt_stop_find("hci0")
+                await asyncio.sleep(0.1)
             ok, detail = await asyncio.to_thread(self._att.connect, timeout=2.0, retries=1)
             if ok:
                 break
