@@ -160,7 +160,8 @@ class ATTClient:
         )
         fd = s.fileno()
 
-        bind_addr = _sockaddr_l2(0, baddr(self.adapter), ATT_CID, LE_PUBLIC)
+        # Bind to adapter — use all-zero BD_ADDR for LE (ignores specific adapter MAC)
+        bind_addr = _sockaddr_l2(0, b"\x00\x00\x00\x00\x00\x00", ATT_CID, LE_PUBLIC)
         if _libc.bind(fd, bind_addr, len(bind_addr)) != 0:
             s.close()
             return False, f"L2CAP bind failed (errno {ctypes.get_errno()})"
