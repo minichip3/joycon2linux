@@ -41,7 +41,7 @@ BUTTON_MAP: dict[str, int] = {
     "MINUS": ecodes.BTN_SELECT,
     "PLUS": ecodes.BTN_START,
     "LS": ecodes.BTN_THUMB,
-    "RS": ecodes.BTN_THUMB_R,
+    "RS": ecodes.BTN_BASE2,
     "HOME": ecodes.BTN_MODE,
     "SL": ecodes.BTN_TL2,
     "SR": ecodes.BTN_TR2,
