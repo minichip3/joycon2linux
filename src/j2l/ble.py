@@ -123,6 +123,22 @@ def _hci_stop_le_scan(adapter: str = "hci0") -> bool:
         return False
 
 
+def _debug_hci_state(adapter: str = "hci0") -> None:
+    """Debug: check HCI controller state."""
+    try:
+        import socket as _socket
+        import struct
+        hci_sock = _socket.socket(_socket.AF_BLUETOOTH,
+                                  _socket.SOCK_RAW,
+                                  _socket.BTPROTO_HCI)
+        idx = int(adapter.replace("hci", "")) if "hci" in adapter else 0
+        hci_sock.bind((idx,))
+        logger.info("HCI socket bound successfully for %s", adapter)
+        hci_sock.close()
+    except Exception as e:
+        logger.info("HCI socket bind failed: %s", e)
+
+
 def _btmgmt_stop_find(adapter: str = "hci0") -> None:
     """Stop discovery at HCI level via btmgmt."""
     idx = adapter.replace("hci", "") if "hci" in adapter else "0"
@@ -186,14 +202,12 @@ class BleConnection:
 
         logger.info("Connecting to BLE device %s", self._address)
 
-        # Kill Steam Input and decky services that hold persistent scans
-        _kill_steam_bt_services()
-        await asyncio.sleep(0.3)
-
-        # Stop LE scan via HCI device (most reliable)
-        _hci_stop_le_scan("hci0")
+        # Stop LE scan before connecting
         _btmgmt_stop_find("hci0")
         _stop_le_scan("hci0")
+
+        # Debug: check HCI state
+        _debug_hci_state("hci0")
         await asyncio.sleep(0.2)
 
         self._att = ATTClient(self._address, adapter="hci0")
