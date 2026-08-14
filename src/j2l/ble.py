@@ -87,12 +87,7 @@ def _stop_le_scan(adapter: str = "hci0") -> None:
 
 
 def _kill_steam_bt_services() -> None:
-    """Kill Steam Input and decky BT services that hold persistent scans.
-
-    Steam Deck에서 Steam Input, decky-bluetooth-wake-control, steam-overlay
-    등이 백그라운드에서 BLE 스캔을 유지해서 btmgmt stop-find로도 연결이 실패함.
-    이 프로세스들을 종료시킨 후 연결하면 안정성이 크게 개선됨.
-    """
+    """Kill Steam Input and decky BT services that hold persistent scans."""
     for pattern in ["decky-bluetooth-wake-control", "steaminput", "steam-overlay"]:
         try:
             subprocess.run(["pkill", "-f", pattern],
@@ -100,6 +95,32 @@ def _kill_steam_bt_services() -> None:
             logger.info("killed %s", pattern)
         except Exception:
             pass
+
+
+def _hci_stop_le_scan(adapter: str = "hci0") -> bool:
+    """Stop LE scan by writing HCI LE Set Scan command to /dev/bluetooth/hciX.
+
+    Writes directly to the HCI device node, bypassing BlueZ/btmgmt entirely.
+    HCI LE Set Scan: opcode 0x0808, params: 0x00 (scan disabled)
+    """
+    import struct
+    import os
+    idx = int(adapter.replace("hci", "")) if "hci" in adapter else 0
+    dev_path = f"/dev/bluetooth/hci{idx}"
+    if not os.path.exists(dev_path):
+        logger.info("HCI device %s not found", dev_path)
+        return False
+    try:
+        fd = os.open(dev_path, os.O_WRONLY | os.O_NONBLOCK)
+        # HCI command: type=1, plen=1, opcode=0x0808, param=0x00
+        cmd = struct.pack("<BBHB", 1, 1, 0x0808, 0x00)
+        os.write(fd, cmd)
+        os.close(fd)
+        logger.info("HCI LE scan disabled via %s", dev_path)
+        return True
+    except Exception as e:
+        logger.info("HCI scan disable failed: %s", e)
+        return False
 
 
 def _btmgmt_stop_find(adapter: str = "hci0") -> None:
@@ -169,7 +190,8 @@ class BleConnection:
         _kill_steam_bt_services()
         await asyncio.sleep(0.3)
 
-        # Stop LE scan
+        # Stop LE scan via HCI device (most reliable)
+        _hci_stop_le_scan("hci0")
         _btmgmt_stop_find("hci0")
         _stop_le_scan("hci0")
         await asyncio.sleep(0.2)
