@@ -44,16 +44,35 @@ class DeviceInfo:
     type: ControllerType
 
 
+async def _cancel_bluetoothctl_scan():
+    """Cancel any active Bluetooth discovery session via bluetoothctl.
+
+    BlueZ allows only one active discovery session at a time. Desktop
+    environments (GNOME/KDE/Steam Deck) often keep one running, which
+    causes ``org.bluez.Error.InProgress`` when bleak tries to start its own.
+    Calling ``bluetoothctl scan off`` cancels that session so bleak can take
+    over.
+    """
+    try:
+        await asyncio.to_thread(
+            subprocess.run,
+            ["bluetoothctl", "--timeout", "5", "scan", "off"],
+            capture_output=True, text=True,
+        )
+        logger.info("Cancelled active bluetoothctl scan")
+    except FileNotFoundError:
+        logger.warning("bluetoothctl not found")
+
+
 async def scan(
     timeout: int = 10,
 ) -> Dict[str, DeviceInfo]:
     """Scan for nearby Switch 2 controllers.
 
     Strategy:
-    1. Try bleak passive scan (may conflict with desktop BlueZ)
-    2. On D-Bus InProgress, fall back to reading cached devices via
-       ``bluetoothctl devices`` — Steam Deck/Bazzite already scans
-       continuously, so Nintendo controllers are likely already cached.
+    1. Try bleak passive scan
+    2. On D-Bus InProgress, cancel active bluetoothctl scan and retry
+    3. If bleak still fails, read paired/cached devices via bluetoothctl
 
     Returns
     -------
@@ -63,32 +82,34 @@ async def scan(
     results: Dict[str, DeviceInfo] = {}
 
     # --- Try bleak passive scan ------------------------------------------
-    bleak_worked = False
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             async with BleakScanner() as scanner:
                 devices = await scanner.discover(
                     timeout=timeout, return_on_first_found=False, passive=True
                 )
-            bleak_worked = True
             for dev in devices:
                 info = _classify_device(dev)
                 if info is not None:
                     results[dev.address.lower()] = info
-            break
+            logger.info("BLE scan complete — found %d controller(s)", len(results))
+            return results
         except BleakDBusError as e:
             if "InProgress" in str(e):
                 if attempt == 0:
                     logger.warning("BlueZ D-Bus busy, retrying...")
                     await asyncio.sleep(1.5)
-                    continue
-                logger.info("BlueZ D-Bus busy — falling back to cached devices")
-                break
+                elif attempt == 1:
+                    logger.info("Cancelling active bluetoothctl scan...")
+                    await _cancel_bluetoothctl_scan()
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.info("BLE scan unavailable — reading cached devices")
+                    results = _scan_cached_devices()
+                    logger.info("BLE scan complete — found %d controller(s)", len(results))
+                    return results
+                continue
             raise
-
-    # --- Fallback: read cached devices from bluetoothctl ------------------
-    if not bleak_worked and not results:
-        results = _scan_cached_devices()
 
     logger.info("BLE scan complete — found %d controller(s)", len(results))
     return results
