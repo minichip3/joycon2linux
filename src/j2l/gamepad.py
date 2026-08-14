@@ -93,7 +93,7 @@ class UinputGamepad:
             axes=axes,
             buttons=buttons,
             name=self._name,
-            bustype=ecodes.BUSTYPE_USB,
+            bustype=3,  # BUS_USB (evdev latest removed BUSTYPE_USB)
             vendor=0x057E,  # Nintendo
             product=0x200E,  # Switch Pro Controller-ish
         )
