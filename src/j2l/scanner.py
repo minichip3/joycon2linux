@@ -45,23 +45,27 @@ class DeviceInfo:
 
 
 async def _cancel_bluetoothctl_scan():
-    """Cancel any active Bluetooth discovery session via bluetoothctl.
+    """Cancel active BlueZ discovery via D-Bus CancelDiscovery call.
 
-    BlueZ allows only one active discovery session at a time. Desktop
-    environments (GNOME/KDE/Steam Deck) often keep one running, which
-    causes ``org.bluez.Error.InProgress`` when bleak tries to start its own.
-    Calling ``bluetoothctl scan off`` cancels that session so bleak can take
-    over.
+    ``bluetoothctl scan off`` only cancels *its own* session, not the one
+    held by the desktop environment (GNOME/KDE). Calling ``CancelDiscovery``
+    on the adapter D-Bus object cancels *all* active discovery sessions.
     """
     try:
         await asyncio.to_thread(
             subprocess.run,
-            ["bluetoothctl", "--timeout", "5", "scan", "off"],
+            [
+                "dbus-send",
+                "--system",
+                "--dest=org.bluez",
+                "/org/bluez/hci0",
+                "org.bluez.Adapter1.CancelDiscovery",
+            ],
             capture_output=True, text=True,
         )
-        logger.info("Cancelled active bluetoothctl scan")
+        logger.info("Cancelled BlueZ discovery via D-Bus")
     except FileNotFoundError:
-        logger.warning("bluetoothctl not found")
+        logger.warning("dbus-send not found")
 
 
 async def scan(
