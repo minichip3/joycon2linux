@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -44,79 +45,23 @@ class DeviceInfo:
     type: ControllerType
 
 
-async def _cancel_bluetoothctl_scan():
-    """Cancel active BlueZ discovery via D-Bus CancelDiscovery call.
-
-    ``bluetoothctl scan off`` only cancels *its own* session, not the one
-    held by the desktop environment (GNOME/KDE). Calling ``CancelDiscovery``
-    on the adapter D-Bus object cancels *all* active discovery sessions.
-    """
-    try:
-        await asyncio.to_thread(
-            subprocess.run,
-            [
-                "dbus-send",
-                "--system",
-                "--dest=org.bluez",
-                "/org/bluez/hci0",
-                "org.bluez.Adapter1.CancelDiscovery",
-            ],
-            capture_output=True, text=True,
-        )
-        logger.info("Cancelled BlueZ discovery via D-Bus")
-    except FileNotFoundError:
-        logger.warning("dbus-send not found")
-
-
 async def scan(
     timeout: int = 10,
 ) -> Dict[str, DeviceInfo]:
     """Scan for nearby Switch 2 controllers.
 
-    Strategy:
-    1. Try bleak passive scan
-    2. On D-Bus InProgress, cancel active bluetoothctl scan and retry
-    3. If bleak still fails, read paired/cached devices via bluetoothctl
+    Steam Deck / Bazzite에서 desktop 환경(GNOME)이 BlueZ 스캔을 계속 차지하고
+    있어서 bleak의 D-Bus 스캔이 ``InProgress`` 에러를 발생시킨다.
+
+    해결책: ``bluetoothctl`` interactive 모드로 직접 스캔하고, ``[NEW]`` 라인을
+    파싱하여 결과를 수집함.
 
     Returns
     -------
     Dict[str, DeviceInfo]
         MAC address (lowercase) → device metadata.
     """
-    results: Dict[str, DeviceInfo] = {}
-
-    # --- Try bleak passive scan ------------------------------------------
-    for attempt in range(3):
-        try:
-            async with BleakScanner() as scanner:
-                devices = await scanner.discover(
-                    timeout=timeout, return_on_first_found=False, passive=True
-                )
-            for dev in devices:
-                info = _classify_device(dev)
-                if info is not None:
-                    results[dev.address.lower()] = info
-            logger.info("BLE scan complete — found %d controller(s)", len(results))
-            return results
-        except BleakDBusError as e:
-            if "InProgress" in str(e):
-                if attempt == 0:
-                    logger.warning("BlueZ D-Bus busy, retrying...")
-                    await asyncio.sleep(1.5)
-                elif attempt == 1:
-                    logger.info("Cancelling active bluetoothctl scan...")
-                    await _cancel_bluetoothctl_scan()
-                    await asyncio.sleep(0.5)
-                else:
-                    logger.info("BLE scan unavailable — reading cached devices")
-                    results = _scan_cached_devices()
-                    logger.info("BLE scan complete — found %d controller(s)", len(results))
-                    return results
-                continue
-            raise
-
-    logger.info("BLE scan complete — found %d controller(s)", len(results))
-    return results
+    return await _scan_with_bluetoothctl(timeout=timeout)
 
 
 def _classify_device(dev) -> DeviceInfo | None:
@@ -149,29 +94,64 @@ def _classify_device(dev) -> DeviceInfo | None:
     return DeviceInfo(name=name, rssi=rssi, type=type_)
 
 
-def _scan_cached_devices() -> Dict[str, DeviceInfo]:
-    """Read Nintendo controllers from BlueZ's cached device list.
+async def _scan_with_bluetoothctl(timeout: int = 10) -> Dict[str, DeviceInfo]:
+    """Scan via ``bluetoothctl`` interactive mode, parsing ``[NEW]`` lines.
 
-    Uses ``bluetoothctl devices`` which queries D-Bus for already-discovered
-    devices without starting a new scan, avoiding the InProgress conflict.
+    bluetoothctl uses the user D-Bus session bus. When run under sudo we
+    must pass ``DBUS_SESSION_BUS_ADDRESS`` from the real user (``deck`` on
+    Steam Deck). Without it bluetoothctl refuses to connect.
+
+    Output format:
+        [NEW] Device AA:BB:CC:DD:EE:FF DeviceName
     """
     results: Dict[str, DeviceInfo] = {}
 
+    # Preserve user D-Bus session for bluetoothctl (needed under sudo)
+    env = dict(os.environ)
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        # Under sudo, user D-Bus session is /run/user/1000/bus (Steam Deck uid)
+        for uid_dir in [str(os.getuid()), "1000"]:
+            sock = f"/run/user/{uid_dir}/bus"
+            if os.path.exists(sock):
+                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={sock}"
+                break
+
     try:
-        proc = subprocess.run(
-            ["bluetoothctl", "devices"],
-            capture_output=True, text=True, timeout=10,
+        proc = subprocess.Popen(
+            ["bluetoothctl"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
         )
-        # Output format: "Device AA:BB:CC:DD:EE:FF DeviceName"
-        for line in proc.stdout.strip().splitlines():
-            parts = line.strip().split(maxsplit=2)
-            if len(parts) < 3 or parts[0] != "Device":
+        proc.stdin.write("scan on\n")
+        proc.stdin.flush()
+
+        # Wait for scan duration, collecting stdout
+        await asyncio.sleep(timeout)
+
+        proc.stdin.write("scan off\n")
+        proc.stdin.flush()
+        await asyncio.sleep(0.5)
+
+        proc.stdin.write("exit\n")
+        proc.stdin.flush()
+        stdout, _ = proc.communicate(timeout=5)
+
+        # Parse [NEW] lines
+        for line in stdout.strip().splitlines():
+            line = line.strip()
+            if not line.startswith("[NEW]"):
                 continue
-            mac_raw = parts[1]
-            name = parts[2]
-            # Validate MAC format
+            parts = line.split()
+            # [NEW] Device AA:BB:CC:DD:EE:FF Name
+            if len(parts) < 4:
+                continue
+            mac_raw = parts[2]
             if ":" not in mac_raw or len(mac_raw) != 17:
                 continue
+            name = parts[3]
             mac = mac_raw.lower()
             name_lower = name.lower()
             if "joy-con" not in name_lower and "pro controller" not in name_lower:
@@ -182,12 +162,14 @@ def _scan_cached_devices() -> Dict[str, DeviceInfo]:
             elif "right" in name_lower:
                 type_ = ControllerType.JOYCON2_RIGHT
             results[mac] = DeviceInfo(name=name, rssi=-1, type=type_)
-            logger.info("Cached device: %s %s (%s)", mac, name, type_.value)
+            logger.info("Found: %s %s (%s)", mac, name, type_.value)
+
     except FileNotFoundError:
         logger.warning("bluetoothctl not found")
     except Exception as e:
-        logger.warning("Cached device scan failed: %s", e)
+        logger.warning("bluetoothctl scan failed: %s", e)
 
+    logger.info("BLE scan complete — found %d controller(s)", len(results))
     return results
 
 
