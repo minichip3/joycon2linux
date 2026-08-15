@@ -49,6 +49,7 @@ static int g_l2cap_fd = -1;     /* L2CAP socket fd */
 static char g_mac[18];          /* "AA:BB:CC:DD:EE:FF" */
 static int g_adapter_idx = 0;   /* adapter index (hci0 -> 0) */
 static int g_connected = 0;
+static int g_last_errno = 0;   /* errno of the last failed socket op */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -122,7 +123,10 @@ static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, uint16_t *acl_handle)
     addr.l2_bdaddr_type = dst_type;
 
     int fd = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        g_last_errno = errno;
+        return -1;
+    }
 
     /* Set security */
     uint8_t sec = BT_SECURITY_LOW;
@@ -139,6 +143,7 @@ static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, uint16_t *acl_handle)
     bind_addr.l2_bdaddr_type = LE_PUBLIC_ADDRESS;
 
     if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        g_last_errno = errno;
         close(fd);
         return -2;
     }
@@ -165,6 +170,7 @@ static int l2cap_connect(bdaddr_t *dst, uint8_t dst_type, uint16_t *acl_handle)
                 return -err;
             }
         } else {
+            g_last_errno = errno;
             close(fd);
             return -4;
         }
@@ -347,12 +353,19 @@ static PyObject *ble_connect(PyObject *self, PyObject *args)
     }
 
     if (fd <= 0) {
+        const char *what;
+        char detail[256];
         if (fd == -3)
-            PyErr_SetString(PyExc_TimeoutError, "L2CAP connect timeout");
+            what = "L2CAP connect timeout";
         else if (fd == -4)
-            PyErr_SetString(PyExc_OSError, "L2CAP connect failed");
+            what = "L2CAP connect failed";
+        else if (fd == -2)
+            what = "bind to adapter failed";
         else
-            PyErr_SetFromErrno(PyExc_OSError);
+            what = "socket() failed";
+        snprintf(detail, sizeof(detail), "%s (errno=%d: %s)",
+                 what, g_last_errno, strerror(g_last_errno));
+        PyErr_SetString(PyExc_OSError, detail);
         return NULL;
     }
 
